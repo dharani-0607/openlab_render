@@ -1,281 +1,219 @@
 
-from flask import Flask, request, jsonify, render_template_string
-from datetime import datetime
-from threading import Lock
+import json
+import os
+import threading
+import time
+
+from flask import Flask, jsonify, request, render_template_string
+import paho.mqtt.client as mqtt
 
 app = Flask(__name__)
-lock = Lock()
 
+PREFIX = "dh_smarthelmet_demo"
+BROKER = "broker.hivemq.com"
+PORT = 1883
+
+lock = threading.Lock()
 state = {
-    "helmet": {
-        "alcohol_raw": None,
-        "alcohol_ok": False,
-        "buckle_closed": False,
-        "rfid_authorized": False,
-        "engine_permit": False,
-        "temperature_c": None,
-        "heart_rate_bpm": None,
-        "spo2_percent": None,
-        "vitals_simulated": True,
-        "crash_detected": False,
-        "g_force": None,
-        "mpu_available": False,
-        "blind_spot": False
-    },
-    "bike": {
-        "left_distance_cm": None,
-        "right_distance_cm": None,
-        "left_blind_spot": False,
-        "right_blind_spot": False,
-        "blind_spot_signal_to_helmet": False,
-        "latitude": None,
-        "longitude": None,
-        "speed_kmh": None,
-        "call_allowed": False,
-        "engine_permit_received": False,
-        "helmet_crash_received": False,
-        "gps_simulated": True
-    },
-    "updated": "Waiting for ESP32 nodes"
+    "helmet": {},
+    "bike": {},
+    "last_update": None,
+    "mqtt_connected": False,
+    "call_status": "No call requested"
 }
 
-HTML = """
+def on_connect(client, userdata, flags, reason_code, properties):
+    connected = (reason_code == 0)
+    with lock:
+        state["mqtt_connected"] = connected
+
+    if connected:
+        client.subscribe([
+            (f"{PREFIX}/helmet/data", 0),
+            (f"{PREFIX}/bike/data", 0)
+        ])
+        print("MQTT connected and subscribed")
+    else:
+        print("MQTT connection failed:", reason_code)
+
+def on_message(client, userdata, msg):
+    try:
+        data = json.loads(msg.payload.decode())
+    except (ValueError, UnicodeDecodeError):
+        print("Invalid MQTT JSON:", msg.topic)
+        return
+
+    with lock:
+        if msg.topic == f"{PREFIX}/helmet/data":
+            state["helmet"] = data
+        elif msg.topic == f"{PREFIX}/bike/data":
+            state["bike"] = data
+        state["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+mqtt_client = mqtt.Client(
+    mqtt.CallbackAPIVersion.VERSION2,
+    client_id="smarthelmet-dashboard"
+)
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
+
+def mqtt_worker():
+    while True:
+        try:
+            mqtt_client.connect(BROKER, PORT, 60)
+            mqtt_client.loop_forever()
+        except Exception as exc:
+            with lock:
+                state["mqtt_connected"] = False
+            print("MQTT reconnect:", exc)
+            time.sleep(5)
+
+threading.Thread(target=mqtt_worker, daemon=True).start()
+
+@app.route("/")
+def index():
+    return render_template_string(PAGE)
+
+@app.route("/api/state")
+def api_state():
+    with lock:
+        return jsonify(state)
+
+@app.route("/api/call", methods=["POST"])
+def api_call():
+    with lock:
+        speed = state["bike"].get("speed_kmh")
+        connected = state["mqtt_connected"]
+
+    if not connected:
+        return jsonify(ok=False, message="MQTT is disconnected"), 503
+
+    if speed is None or float(speed) >= 1.0:
+        return jsonify(ok=False, message="Call allowed only at zero speed"), 400
+
+    result = mqtt_client.publish(
+        f"{PREFIX}/dashboard/command",
+        json.dumps({"action": "call"}),
+        qos=0
+    )
+
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        return jsonify(ok=False, message="MQTT publish failed"), 503
+
+    with lock:
+        state["call_status"] = "Demo call request published"
+
+    return jsonify(ok=True, message="Demo call request sent")
+
+PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Smart Helmet Dashboard</title>
 <style>
-body{font-family:Arial;background:#f1f5f9;color:#172033;margin:0}
-header{background:#13243b;color:white;padding:22px}
-main{max-width:1100px;margin:auto;padding:20px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:15px}
-.card{background:white;border-radius:12px;padding:18px;box-shadow:0 3px 12px #0001}
-h2{font-size:18px}
-.item{display:flex;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px solid #eee}
-.value{font-weight:bold;text-align:right}
-.pill{padding:8px;border-radius:8px;font-weight:bold;display:inline-block}
-.ok{background:#dcfce7;color:#166534}
-.bad{background:#fee2e2;color:#991b1b}
-.warn{background:#fef3c7;color:#92400e}
-button{padding:12px 16px;background:#2563eb;color:white;border:0;border-radius:8px;font-weight:bold}
-button:disabled{background:#9ca3af}
-small{color:#64748b}
+body {font-family:Arial,sans-serif;max-width:950px;margin:24px auto;
+padding:0 14px;background:#f4f6f8;color:#17202a}
+h1 {margin-bottom:6px}
+.cards {display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+.card {background:white;padding:18px;border-radius:12px;
+box-shadow:0 2px 8px #0001}
+.value {font-size:1.15rem;font-weight:bold}
+button {padding:12px 18px;border:0;border-radius:8px;
+background:#1769aa;color:white;font-size:1rem}
+small {color:#555}
 </style>
 </head>
 <body>
-<header>
-<h1>Smart Helmet & Bike Monitoring</h1>
-<p>ESP32 simulation dashboard</p>
-</header>
-<main>
-<div class="grid">
-<section class="card">
-<h2>Vehicle Interlock</h2>
-<div id="engine" class="pill bad">LOCKED</div>
-<div class="item"><span>Alcohol</span><b id="alcoholOK">Waiting</b></div>
-<div class="item"><span>Buckle</span><b id="buckle">Waiting</b></div>
-<div class="item"><span>RFID</span><b id="rfid">Waiting</b></div>
-<p><small>All three conditions must pass.</small></p>
-</section>
-
-<section class="card">
-<h2>Helmet Sensors</h2>
-<div class="item"><span>MQ-3 raw value</span><b id="alcohol">--</b></div>
-<div class="item"><span>Temperature</span><b id="temp">--</b></div>
-<div class="item"><span>Heart rate</span><b id="hr">--</b></div>
-<div class="item"><span>SpO2</span><b id="spo2">--</b></div>
-<div class="item"><span>Acceleration</span><b id="gforce">--</b></div>
-<div class="item"><span>Crash status</span><b id="crash">--</b></div>
-<p><small>Heart rate, SpO2 and temperature are simulated.</small></p>
-</section>
-
-<section class="card">
-<h2>Bike Sensors</h2>
-<div class="item"><span>Left distance</span><b id="left">--</b></div>
-<div class="item"><span>Right distance</span><b id="right">--</b></div>
-<div class="item"><span>Blind-spot signal</span><b id="blind">--</b></div>
-<div class="item"><span>GPS coordinates</span><b id="gps">--</b></div>
-<div class="item"><span>Speed</span><b id="speed">--</b></div>
-<p><small>GPS coordinates and speed are simulated.</small></p>
-</section>
-
-<section class="card">
-<h2>Call Control</h2>
-<p>Request a call only when speed is below 1 km/h.</p>
-<button id="callBtn" disabled onclick="requestCall()">Call locked</button>
-<p id="callMessage">Waiting for bike speed</p>
-<small>This button does not place a real phone call.</small>
-</section>
-
-<section class="card">
-<h2>Crash Recording</h2>
-<div id="recording" class="pill warn">STANDBY</div>
-<p id="recordingText">Camera simulation only; no video is recorded.</p>
-</section>
+<h1>Smart Helmet Dashboard</h1>
+<p>MQTT-connected simulation · <span id="connection">Connecting...</span></p>
+<div class="cards">
+  <div class="card">
+    <h2>Helmet</h2>
+    <p>Alcohol raw: <span id="alcohol">--</span></p>
+    <p>Buckle: <span id="buckle">--</span></p>
+    <p>RFID authorized: <span id="rfid">--</span></p>
+    <p>Engine permit: <span id="permit" class="value">--</span></p>
+    <p>Crash detected: <span id="crash">--</span></p>
+  </div>
+  <div class="card">
+    <h2>Vitals (simulated)</h2>
+    <p>Temperature: <span id="temp">--</span> °C</p>
+    <p>Heart rate: <span id="hr">--</span> bpm</p>
+    <p>SpO₂: <span id="spo2">--</span>%</p>
+  </div>
+  <div class="card">
+    <h2>Bike</h2>
+    <p>Left obstacle: <span id="left">--</span> cm</p>
+    <p>Right obstacle: <span id="right">--</span> cm</p>
+    <p>Speed: <span id="speed">--</span> km/h</p>
+    <p>Coordinates: <span id="gps">--</span></p>
+    <p>Blind spot: <span id="blind">--</span></p>
+  </div>
+  <div class="card">
+    <h2>Alerts and demo call</h2>
+    <p id="callstatus">No call requested</p>
+    <button id="callbutton" onclick="requestCall()">Request demo call</button>
+    <p><small>Enabled only when reported speed is zero.</small></p>
+    <p>Last update: <span id="updated">--</span></p>
+  </div>
 </div>
-<p><small>Last update: <span id="updated">--</span></small></p>
-</main>
-
 <script>
 const el = id => document.getElementById(id);
-const show = (id, value) => {
-  el(id).textContent =
-    value === null || value === undefined ? "--" : value;
-};
+const show = (id, value) => el(id).textContent =
+  value === undefined || value === null ? "--" : value;
 
 async function refresh() {
   try {
-    const response = await fetch("/api/state");
-    const s = await response.json();
-    const h = s.helmet, b = s.bike;
+    const r = await fetch("/api/state", {cache:"no-store"});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    const h = s.helmet || {}, b = s.bike || {};
 
-    show("engine", h.engine_permit ? "ENGINE PERMIT" : "LOCKED");
-    el("engine").className = "pill " +
-      (h.engine_permit ? "ok" : "bad");
-
-    show("alcoholOK", h.alcohol_ok ? "PASS" : "FAIL / UNKNOWN");
-    show("buckle", h.buckle_closed ? "FASTENED" : "OPEN");
-    show("rfid", h.rfid_authorized ? "AUTHORIZED" : "NOT AUTHORIZED");
-
+    show("connection", s.mqtt_connected ? "MQTT connected" : "MQTT disconnected");
     show("alcohol", h.alcohol_raw);
-    show("temp", h.temperature_c === null ? "--" :
-      Number(h.temperature_c).toFixed(1) + " °C");
-    show("hr", h.heart_rate_bpm === null ? "--" :
-      h.heart_rate_bpm + " bpm");
-    show("spo2", h.spo2_percent === null ? "--" :
-      Number(h.spo2_percent).toFixed(1) + "%");
-    show("gforce", h.g_force === null ? "--" :
-      Number(h.g_force).toFixed(2) + " g");
-    show("crash", h.crash_detected ? "CRASH ALERT" : "No alert");
+    show("buckle", h.buckle_closed === undefined ? "--" : h.buckle_closed ? "Fastened" : "Open");
+    show("rfid", h.rfid_authorized);
+    show("permit", h.engine_permit);
+    show("crash", h.crash_detected);
+    show("temp", h.temperature_c);
+    show("hr", h.heart_rate_bpm);
+    show("spo2", h.spo2_percent);
+    show("left", b.left_distance_cm);
+    show("right", b.right_distance_cm);
+    show("speed", b.speed_kmh);
+    show("gps", b.latitude === undefined ? "--" : b.latitude + ", " + b.longitude);
+    show("blind", b.blind_spot_signal_to_helmet);
+    show("updated", s.last_update);
+    show("callstatus", s.call_status || "No call requested");
 
-    show("left", b.left_distance_cm === null ? "--" :
-      Number(b.left_distance_cm).toFixed(1) + " cm");
-    show("right", b.right_distance_cm === null ? "--" :
-      Number(b.right_distance_cm).toFixed(1) + " cm");
-
-    show("blind", b.blind_spot_signal_to_helmet ?
-      "ACTIVE — LED ON" : "CLEAR — LED OFF");
-
-    show("gps", b.latitude === null || b.longitude === null ? "--" :
-      Number(b.latitude).toFixed(5) + ", " +
-      Number(b.longitude).toFixed(5));
-
-    show("speed", b.speed_kmh === null ? "--" :
-      Number(b.speed_kmh).toFixed(1) + " km/h");
-
-    const stopped = b.speed_kmh !== null &&
-      b.speed_kmh !== undefined && Number(b.speed_kmh) < 1;
-
-    el("callBtn").disabled = !stopped;
-    el("callBtn").textContent = stopped ?
-      "Request call" : "Call locked — bike moving";
-
-    show("recording", h.crash_detected ?
-      "CRASH EVENT (SIMULATED)" : "STANDBY");
-
-    el("recording").className = "pill " +
-      (h.crash_detected ? "bad" : "warn");
-
-    show("recordingText", h.crash_detected ?
-      "Crash event detected; actual video is not recorded." :
-      "Camera simulation only; no video is recorded.");
-
-    show("updated", s.updated);
-  } catch (error) {
-    show("updated", "Backend unavailable");
+    el("callbutton").disabled =
+      !s.mqtt_connected || b.speed_kmh === undefined || Number(b.speed_kmh) >= 1;
+    el("callbutton").style.opacity = el("callbutton").disabled ? "0.5" : "1";
+  } catch (e) {
+    show("connection", "Dashboard API error");
+    el("callbutton").disabled = true;
   }
 }
 
 async function requestCall() {
-  const response = await fetch("/api/call", {method: "POST"});
-  const data = await response.json();
-  show("callMessage", data.message);
-  await refresh();
+  el("callbutton").disabled = true;
+  try {
+    const r = await fetch("/api/call", {method:"POST"});
+    const d = await r.json();
+    show("callstatus", d.message || "Request complete");
+  } catch (e) {
+    show("callstatus", "Could not send request");
+  }
+  refresh();
 }
 
 refresh();
-setInterval(refresh, 1000);
+setInterval(refresh, 2000);
 </script>
 </body>
 </html>
 """
 
-@app.get("/")
-def home():
-    return render_template_string(HTML)
-
-@app.get("/api/state")
-def get_state():
-    with lock:
-        return jsonify(state)
-
-@app.get("/api/helmet")
-def get_helmet():
-    with lock:
-        return jsonify(state["helmet"])
-
-@app.post("/api/helmet")
-def update_helmet():
-    data = request.get_json(silent=True) or {}
-
-    required = [
-        "alcohol_raw", "alcohol_ok", "buckle_closed",
-        "rfid_authorized", "engine_permit"
-    ]
-
-    if any(key not in data for key in required):
-        return jsonify({"error": "Missing required fields"}), 400
-
-    # Recalculate the interlock on the server as well.
-    alcohol_ok = data["alcohol_ok"] is True
-    buckle_ok = data["buckle_closed"] is True
-    rfid_ok = data["rfid_authorized"] is True
-
-    data["engine_permit"] = alcohol_ok and buckle_ok and rfid_ok
-
-    with lock:
-        state["helmet"].update(data)
-        state["updated"] = datetime.now().strftime("%H:%M:%S")
-
-    return jsonify({"success": True})
-
-@app.post("/api/bike")
-def update_bike():
-    data = request.get_json(silent=True) or {}
-
-    required = ["speed_kmh", "blind_spot_signal_to_helmet"]
-    if any(key not in data for key in required):
-        return jsonify({"error": "Missing required fields"}), 400
-
-    try:
-        speed = float(data["speed_kmh"])
-        if not 0 <= speed <= 120:
-            raise ValueError()
-    except (TypeError, ValueError):
-        return jsonify({"error": "Invalid speed"}), 400
-
-    with lock:
-        state["bike"].update(data)
-        state["updated"] = datetime.now().strftime("%H:%M:%S")
-
-    return jsonify({"success": True})
-
-@app.post("/api/call")
-def request_call():
-    with lock:
-        speed = state["bike"].get("speed_kmh")
-
-        if speed is not None and float(speed) < 1:
-            return jsonify({
-                "success": True,
-                "message": "Call request accepted (simulation only)."
-            })
-
-    return jsonify({
-        "success": False,
-        "message": "Call blocked: speed is not confirmed below 1 km/h."
-    }), 403
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
